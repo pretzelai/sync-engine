@@ -78,7 +78,7 @@ export class StripeSync {
       // @ts-ignore
       apiVersion: config.stripeApiVersion,
       appInfo: {
-        name: 'Stripe Sync Engine',
+        name: config.appName ?? 'Stripe Sync Engine',
         version: pkg.version,
         url: pkg.homepage,
       },
@@ -173,65 +173,72 @@ export class StripeSync {
         upsertFn: (items, id, bf) => this.upsertInvoices(items as Stripe.Invoice[], id, bf),
         supportsCreatedFilter: true,
       },
+      balance_transaction: {
+        order: 8, // Before charge
+        listFn: (p) => this.stripe.balanceTransactions.list(p),
+        upsertFn: (items, id) =>
+          this.upsertBalanceTransactions(items as Stripe.BalanceTransaction[], id),
+        supportsCreatedFilter: true,
+      },
       charge: {
-        order: 8, // Depends on customer, invoice
+        order: 9, // Depends on customer, invoice
         listFn: (p) => this.stripe.charges.list(p),
         upsertFn: (items, id, bf) => this.upsertCharges(items as Stripe.Charge[], id, bf),
         supportsCreatedFilter: true,
       },
       setup_intent: {
-        order: 9, // Depends on customer
+        order: 10, // Depends on customer
         listFn: (p) => this.stripe.setupIntents.list(p),
         upsertFn: (items, id, bf) => this.upsertSetupIntents(items as Stripe.SetupIntent[], id, bf),
         supportsCreatedFilter: true,
       },
       payment_method: {
-        order: 10, // Depends on customer (special: iterates customers)
+        order: 11, // Depends on customer (special: iterates customers)
         listFn: (p) => this.stripe.paymentMethods.list(p),
         upsertFn: (items, id, bf) =>
           this.upsertPaymentMethods(items as Stripe.PaymentMethod[], id, bf),
         supportsCreatedFilter: false, // Requires customer param, can't filter by created
       },
       payment_intent: {
-        order: 11, // Depends on customer
+        order: 12, // Depends on customer
         listFn: (p) => this.stripe.paymentIntents.list(p),
         upsertFn: (items, id, bf) =>
           this.upsertPaymentIntents(items as Stripe.PaymentIntent[], id, bf),
         supportsCreatedFilter: true,
       },
       tax_id: {
-        order: 12, // Depends on customer
+        order: 13, // Depends on customer
         listFn: (p) => this.stripe.taxIds.list(p),
         upsertFn: (items, id, bf) => this.upsertTaxIds(items as Stripe.TaxId[], id, bf),
         supportsCreatedFilter: false, // taxIds don't support created filter
       },
       credit_note: {
-        order: 13, // Depends on invoice
+        order: 14, // Depends on invoice
         listFn: (p) => this.stripe.creditNotes.list(p),
         upsertFn: (items, id, bf) => this.upsertCreditNotes(items as Stripe.CreditNote[], id, bf),
         supportsCreatedFilter: true, // credit_notes support created filter
       },
       dispute: {
-        order: 14, // Depends on charge
+        order: 15, // Depends on charge
         listFn: (p) => this.stripe.disputes.list(p),
         upsertFn: (items, id, bf) => this.upsertDisputes(items as Stripe.Dispute[], id, bf),
         supportsCreatedFilter: true,
       },
       early_fraud_warning: {
-        order: 15, // Depends on charge
+        order: 16, // Depends on charge
         listFn: (p) => this.stripe.radar.earlyFraudWarnings.list(p),
         upsertFn: (items, id) =>
           this.upsertEarlyFraudWarning(items as Stripe.Radar.EarlyFraudWarning[], id),
         supportsCreatedFilter: true,
       },
       refund: {
-        order: 16, // Depends on charge
+        order: 17, // Depends on charge
         listFn: (p) => this.stripe.refunds.list(p),
         upsertFn: (items, id, bf) => this.upsertRefunds(items as Stripe.Refund[], id, bf),
         supportsCreatedFilter: true,
       },
       checkout_sessions: {
-        order: 17, // Depends on customer (optional)
+        order: 18, // Depends on customer (optional)
         listFn: (p) => this.stripe.checkout.sessions.list(p),
         upsertFn: (items, id) =>
           this.upsertCheckoutSessions(items as Stripe.Checkout.Session[], id),
@@ -654,11 +661,22 @@ export class StripeSync {
   private async handleChargeEvent(event: Stripe.Event, accountId: string): Promise<void> {
     const { entity: charge, refetched } = await this.fetchOrUseWebhookData(
       event.data.object as Stripe.Charge,
-      (id) => this.stripe.charges.retrieve(id),
+      (id) => this.stripe.charges.retrieve(id, { expand: ['balance_transaction'] }),
       (charge) => charge.status === 'failed' || charge.status === 'succeeded'
     )
 
-    await this.upsertCharges([charge], accountId, false, this.getSyncTimestamp(event, refetched))
+    const syncTimestamp = this.getSyncTimestamp(event, refetched)
+
+    // Extract and upsert expanded balance_transaction
+    if (charge.balance_transaction && typeof charge.balance_transaction === 'object') {
+      await this.upsertBalanceTransactions(
+        [charge.balance_transaction as Stripe.BalanceTransaction],
+        accountId,
+        syncTimestamp
+      )
+    }
+
+    await this.upsertCharges([charge], accountId, false, syncTimestamp)
   }
 
   private async handleCustomerDeletedEvent(
@@ -870,11 +888,23 @@ export class StripeSync {
   private async handleDisputeEvent(event: Stripe.Event, accountId: string): Promise<void> {
     const { entity: dispute, refetched } = await this.fetchOrUseWebhookData(
       event.data.object as Stripe.Dispute,
-      (id) => this.stripe.disputes.retrieve(id),
+      (id) => this.stripe.disputes.retrieve(id, { expand: ['balance_transactions'] }),
       (dispute) => dispute.status === 'won' || dispute.status === 'lost'
     )
 
-    await this.upsertDisputes([dispute], accountId, false, this.getSyncTimestamp(event, refetched))
+    const syncTimestamp = this.getSyncTimestamp(event, refetched)
+
+    // Extract and upsert expanded balance_transactions (disputes have an array)
+    if (dispute.balance_transactions && Array.isArray(dispute.balance_transactions)) {
+      const expandedBalanceTransactions = dispute.balance_transactions.filter(
+        (bt: Stripe.BalanceTransaction) => typeof bt === 'object' && bt !== null
+      )
+      if (expandedBalanceTransactions.length > 0) {
+        await this.upsertBalanceTransactions(expandedBalanceTransactions, accountId, syncTimestamp)
+      }
+    }
+
+    await this.upsertDisputes([dispute], accountId, false, syncTimestamp)
   }
 
   private async handlePaymentIntentEvent(event: Stripe.Event, accountId: string): Promise<void> {
@@ -928,10 +958,21 @@ export class StripeSync {
   private async handleRefundEvent(event: Stripe.Event, accountId: string): Promise<void> {
     const { entity: refund, refetched } = await this.fetchOrUseWebhookData(
       event.data.object as Stripe.Refund,
-      (id) => this.stripe.refunds.retrieve(id)
+      (id) => this.stripe.refunds.retrieve(id, { expand: ['balance_transaction'] })
     )
 
-    await this.upsertRefunds([refund], accountId, false, this.getSyncTimestamp(event, refetched))
+    const syncTimestamp = this.getSyncTimestamp(event, refetched)
+
+    // Extract and upsert expanded balance_transaction
+    if (refund.balance_transaction && typeof refund.balance_transaction === 'object') {
+      await this.upsertBalanceTransactions(
+        [refund.balance_transaction as Stripe.BalanceTransaction],
+        accountId,
+        syncTimestamp
+      )
+    }
+
+    await this.upsertRefunds([refund], accountId, false, syncTimestamp)
   }
 
   private async handleReviewEvent(event: Stripe.Event, accountId: string): Promise<void> {
@@ -1215,6 +1256,7 @@ export class StripeSync {
       setup_intent: 'setup_intents',
       payment_method: 'payment_methods',
       dispute: 'disputes',
+      balance_transaction: 'balance_transactions',
       charge: 'charges',
       payment_intent: 'payment_intents',
       plan: 'plans',
@@ -1436,6 +1478,7 @@ export class StripeSync {
       apiKey: this.config.stripeSecretKey,
       sql: sigmaSql,
       logger: this.config.logger,
+      appName: this.config.appName,
     })
 
     const rows = parseCsvObjects(csv)
@@ -2068,6 +2111,34 @@ export class StripeSync {
     })
   }
 
+  async syncBalanceTransactions(syncParams?: SyncParams): Promise<Sync> {
+    this.config.logger?.info('Syncing balance_transactions')
+
+    return this.withSyncRun(
+      'balance_transactions',
+      'syncBalanceTransactions',
+      async (cursor, runStartedAt) => {
+        const accountId = await this.getAccountId()
+        const params: Stripe.BalanceTransactionListParams = { limit: 100 }
+
+        if (syncParams?.created) {
+          params.created = syncParams.created
+        } else if (cursor) {
+          params.created = { gte: cursor }
+          this.config.logger?.info(`Incremental sync from cursor: ${cursor}`)
+        }
+
+        return this.fetchAndUpsert(
+          (pagination) => this.stripe.balanceTransactions.list({ ...params, ...pagination }),
+          (items) => this.upsertBalanceTransactions(items, accountId),
+          accountId,
+          'balance_transactions',
+          runStartedAt
+        )
+      }
+    )
+  }
+
   async syncCharges(syncParams?: SyncParams): Promise<Sync> {
     this.config.logger?.info('Syncing charges')
 
@@ -2620,6 +2691,19 @@ export class StripeSync {
     }
   }
 
+  private async upsertBalanceTransactions(
+    balanceTransactions: Stripe.BalanceTransaction[],
+    accountId: string,
+    syncTimestamp?: string
+  ): Promise<Stripe.BalanceTransaction[]> {
+    return this.postgresClient.upsertManyWithTimestampProtection(
+      balanceTransactions,
+      'balance_transactions',
+      accountId,
+      syncTimestamp
+    )
+  }
+
   private async upsertCharges(
     charges: Stripe.Charge[],
     accountId: string,
@@ -3064,19 +3148,36 @@ export class StripeSync {
       let hasMore = true
       let startingAfter: string | undefined = undefined
 
-      while (hasMore) {
-        const response: Stripe.ApiList<Stripe.LineItem> =
-          await this.stripe.checkout.sessions.listLineItems(checkoutSessionId, {
-            limit: 100,
-            ...(startingAfter ? { starting_after: startingAfter } : {}),
-          })
+      try {
+        while (hasMore) {
+          const response: Stripe.ApiList<Stripe.LineItem> =
+            await this.stripe.checkout.sessions.listLineItems(checkoutSessionId, {
+              limit: 100,
+              ...(startingAfter ? { starting_after: startingAfter } : {}),
+            })
 
-        lineItemResponses.push(...response.data)
+          lineItemResponses.push(...response.data)
 
-        hasMore = response.has_more
-        if (response.data.length > 0) {
-          startingAfter = response.data[response.data.length - 1].id
+          hasMore = response.has_more
+          if (response.data.length > 0) {
+            startingAfter = response.data[response.data.length - 1].id
+          }
         }
+      } catch (err) {
+        // Old test mode Checkout Sessions may not have line items available
+        // Stripe returns 404 with "Could not find line items for this Checkout Session"
+        // Skip line items for these sessions and continue syncing
+        if (
+          err instanceof Error &&
+          'statusCode' in err &&
+          (err as { statusCode: number }).statusCode === 404
+        ) {
+          this.config.logger?.warn(
+            `Skipping line items for checkout session ${checkoutSessionId}: line items not available (old test mode session)`
+          )
+          continue
+        }
+        throw err
       }
 
       await this.upsertCheckoutSessionLineItems(

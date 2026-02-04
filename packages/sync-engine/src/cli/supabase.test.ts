@@ -3,9 +3,9 @@ import { webhookFunctionCode, workerFunctionCode, sigmaWorkerFunctionCode } from
 
 describe('Edge Function Files', () => {
   describe('webhookFunctionCode', () => {
-    test('imports StripeSync from npm', () => {
-      expect(webhookFunctionCode).toContain(
-        "import { StripeSync } from 'npm:stripe-experiment-sync'"
+    test('imports StripeSync from npm package', () => {
+      expect(webhookFunctionCode).toMatch(
+        /import \{ StripeSync \} from 'npm:@paymentsdb\/sync-engine(@[\d.]+)?'/
       )
     })
 
@@ -47,9 +47,9 @@ describe('Edge Function Files', () => {
   })
 
   describe('workerFunctionCode', () => {
-    test('imports StripeSync from npm', () => {
-      expect(workerFunctionCode).toContain(
-        "import { StripeSync } from 'npm:stripe-experiment-sync'"
+    test('imports StripeSync from npm package', () => {
+      expect(workerFunctionCode).toMatch(
+        /import \{ StripeSync \} from 'npm:@paymentsdb\/sync-engine(@[\d.]+)?'/
       )
     })
 

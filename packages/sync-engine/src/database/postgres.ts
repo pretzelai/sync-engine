@@ -23,6 +23,7 @@ const ORDERED_STRIPE_TABLES = [
   'checkout_session_line_items',
   'checkout_sessions',
   'tax_ids',
+  'balance_transactions',
   'charges',
   'refunds',
   'credit_notes',

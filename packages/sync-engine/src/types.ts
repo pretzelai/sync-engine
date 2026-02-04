@@ -39,6 +39,12 @@ export type StripeSyncConfig = {
   stripeSecretKey: string
 
   /**
+   * Application name sent to Stripe in the User-Agent header via appInfo.
+   * Default: 'Stripe Sync Engine'
+   */
+  appName?: string
+
+  /**
    * Enables syncing Stripe Sigma (reporting) tables via the Sigma API.
    *
    * Default: false (opt-in, so workers don't enqueue Sigma jobs unexpectedly).
@@ -138,6 +144,7 @@ export type SyncObject =
   | 'payment_method'
   | 'dispute'
   | 'charge'
+  | 'balance_transaction'
   | 'payment_intent'
   | 'plan'
   | 'tax_id'
@@ -162,6 +169,7 @@ export interface SyncBackfill {
   paymentMethods?: Sync
   disputes?: Sync
   charges?: Sync
+  balanceTransactions?: Sync
   taxIds?: Sync
   creditNotes?: Sync
   earlyFraudWarnings?: Sync

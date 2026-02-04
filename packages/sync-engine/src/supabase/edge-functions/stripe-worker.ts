@@ -20,7 +20,7 @@
  *   processing on timeout/crash is safe.
  */
 
-import { StripeSync } from 'npm:stripe-experiment-sync'
+import { StripeSync } from 'npm:@paymentsdb/sync-engine'
 import postgres from 'npm:postgres'
 
 const QUEUE_NAME = 'stripe_sync_work'
@@ -80,6 +80,7 @@ Deno.serve(async (req) => {
       poolConfig: { connectionString: dbUrl, max: 1 },
       stripeSecretKey: Deno.env.get('STRIPE_SECRET_KEY')!,
       enableSigma: (Deno.env.get('ENABLE_SIGMA') ?? 'false') === 'true',
+      appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
     })
   } catch (error) {
     await sql.end()

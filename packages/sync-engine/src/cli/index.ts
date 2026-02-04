@@ -13,7 +13,7 @@ import {
 const program = new Command()
 
 program
-  .name('stripe-experiment-sync')
+  .name('paymentsdb-sync')
   .description('CLI tool for syncing Stripe data to PostgreSQL')
   .version(pkg.version)
 

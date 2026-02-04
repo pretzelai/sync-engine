@@ -1,4 +1,4 @@
-import { StripeSync, runMigrations, VERSION } from 'npm:stripe-experiment-sync'
+import { StripeSync, runMigrations, VERSION } from 'npm:@paymentsdb/sync-engine'
 import postgres from 'npm:postgres'
 
 // Get management API base URL from environment variable (for testing against localhost/staging)
@@ -200,6 +200,7 @@ Deno.serve(async (req) => {
       stripeSync = new StripeSync({
         poolConfig: { connectionString: dbUrl, max: 2 },
         stripeSecretKey: stripeKey,
+        appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
       })
 
       // Delete all managed webhooks
@@ -360,6 +361,7 @@ Deno.serve(async (req) => {
     stripeSync = new StripeSync({
       poolConfig: { connectionString: dbUrl, max: 2 }, // Need 2 for advisory lock + queries
       stripeSecretKey: Deno.env.get('STRIPE_SECRET_KEY'),
+      appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
     })
 
     // Release any stale advisory locks from previous timeouts

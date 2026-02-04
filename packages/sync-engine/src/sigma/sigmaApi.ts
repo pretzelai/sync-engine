@@ -126,9 +126,18 @@ export async function runSigmaQueryAndDownloadCsv(params: {
   logger?: Logger
   pollTimeoutMs?: number
   pollIntervalMs?: number
+  appName?: string
 }): Promise<{ queryRunId: string; fileId: string; csv: string }> {
   const pollTimeoutMs = params.pollTimeoutMs ?? 5 * 60 * 1000
   const pollIntervalMs = params.pollIntervalMs ?? 2000
+
+  const stripe = new Stripe(params.apiKey, {
+    appInfo: {
+      name: params.appName ?? 'Stripe Sync Engine',
+      version: pkg.version,
+      url: pkg.homepage,
+    },
+  })
 
   // 1) Create query run
   const { queryRunId } = await createSigmaQueryRun({ apiKey: params.apiKey, sql: params.sql })

@@ -1,4 +1,4 @@
-import { StripeSync } from 'npm:stripe-experiment-sync'
+import { StripeSync } from 'npm:@paymentsdb/sync-engine'
 
 Deno.serve(async (req) => {
   if (req.method !== 'POST') {
@@ -19,6 +19,7 @@ Deno.serve(async (req) => {
   const stripeSync = new StripeSync({
     poolConfig: { connectionString: dbUrl, max: 1 },
     stripeSecretKey: Deno.env.get('STRIPE_SECRET_KEY')!,
+    appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
   })
 
   try {

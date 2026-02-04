@@ -85,20 +85,6 @@ export class SupabaseSetupClient {
   }
 
   /**
-   * Inject package version into Edge Function code
-   */
-  private injectPackageVersion(code: string, version: string): string {
-    if (version === 'latest') {
-      return code
-    }
-    // Replace unversioned npm imports with versioned ones
-    return code.replace(
-      /from ['"]npm:stripe-experiment-sync['"]/g,
-      `from 'npm:stripe-experiment-sync@${version}'`
-    )
-  }
-
-  /**
    * Set secrets for Edge Functions
    */
   async setSecrets(secrets: { name: string; value: string }[]): Promise<void> {
@@ -461,6 +447,20 @@ export class SupabaseSetupClient {
     } catch (error) {
       throw new Error(`Uninstall failed: ${error instanceof Error ? error.message : String(error)}`)
     }
+  }
+
+  /**
+   * Inject package version into Edge Function code
+   */
+  private injectPackageVersion(code: string, version: string): string {
+    if (version === 'latest') {
+      return code
+    }
+    // Replace unversioned npm imports with versioned ones
+    return code.replace(
+      /from ['"]npm:@paymentsdb\/sync-engine['"]/g,
+      `from 'npm:@paymentsdb/sync-engine@${version}'`
+    )
   }
 
   async install(

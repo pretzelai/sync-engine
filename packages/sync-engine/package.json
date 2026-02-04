@@ -1,11 +1,13 @@
 {
-  "name": "stripe-experiment-sync",
-  "version": "1.0.20",
+  "name": "@paymentsdb/sync-engine",
+  "version": "0.0.4",
   "private": false,
   "description": "Stripe Sync Engine to sync Stripe data to Postgres",
   "type": "module",
   "main": "./dist/index.cjs",
-  "bin": "./dist/cli/index.js",
+  "bin": {
+    "sync-engine": "./dist/cli/index.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -59,9 +61,13 @@
     "@types/ws": "^8.5.13",
     "@types/yesql": "^4.1.4",
     "@vitest/ui": "^4.0.9",
-    "tsx": "^4.19.2",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
+  "packageManager": "pnpm@10.21.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/stripe-experiments/sync-engine.git"
@@ -80,5 +86,6 @@
     "database",
     "typescript"
   ],
-  "author": "Stripe <https://stripe.com/>"
+  "author": "PaymentsDB <https://paymentsdb.com/>",
+  "license": "Apache-2.0"
 }
