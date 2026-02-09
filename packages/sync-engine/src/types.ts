@@ -152,6 +152,7 @@ export type SyncObject =
   | 'early_fraud_warning'
   | 'refund'
   | 'checkout_sessions'
+  | '_event_catchup'
 export interface Sync {
   synced: number
 }

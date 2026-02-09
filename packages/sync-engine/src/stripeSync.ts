@@ -244,6 +244,12 @@ export class StripeSync {
           this.upsertCheckoutSessions(items as Stripe.Checkout.Session[], id),
         supportsCreatedFilter: true,
       },
+      _event_catchup: {
+        order: 99, // Always runs last — catches missed webhook events
+        listFn: (_p) => Promise.resolve({ data: [], has_more: false } as any),
+        upsertFn: async () => [],
+        supportsCreatedFilter: true,
+      },
     }
 
     const maxOrder = Math.max(...Object.values(core).map((cfg) => cfg.order))
@@ -1265,6 +1271,7 @@ export class StripeSync {
       early_fraud_warning: 'early_fraud_warnings',
       refund: 'refunds',
       checkout_sessions: 'checkout_sessions',
+      _event_catchup: '_event_catchup',
     }
     return mapping[object] || object
   }
@@ -1285,11 +1292,14 @@ export class StripeSync {
   ): Promise<ProcessNextResult> {
     const limit = 100 // Stripe page size
 
-    // Handle special cases that require customer context
-    if (object === 'payment_method' || object === 'tax_id') {
-      this.config.logger?.warn(`processNext for ${object} requires customer context`)
-      await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
-      return { processed: 0, hasMore: false, runStartedAt }
+    // Payment methods require customer context - route to custom handler
+    if (object === 'payment_method') {
+      return this.fetchOnePagePaymentMethods(accountId, resourceName, runStartedAt, cursor, pageCursor, params)
+    }
+
+    // Events catch-up uses its own fetch strategy
+    if (object === '_event_catchup') {
+      return this.fetchOnePageEventCatchup(accountId, resourceName, runStartedAt, cursor, pageCursor)
     }
 
     // Look up config from registry
@@ -1525,6 +1535,534 @@ export class StripeSync {
   }
 
   /**
+   * Fetch payment methods by iterating customers in batches.
+   *
+   * Most customers have 1-2 PMs, so processing one customer per processNext call
+   * would be extremely wasteful (10,000 customers = 10,000 worker round-trips).
+   * Instead, each call fetches a batch of customers (sized by maxConcurrentCustomers,
+   * default 10) and lists+upserts PMs for all of them concurrently.
+   *
+   * Cursor semantics:
+   * - cursor: max customer `created` timestamp — filters to only new customers on subsequent runs
+   * - pageCursor: last processed customer ID — tracks position in customer iteration
+   */
+  private async fetchOnePagePaymentMethods(
+    accountId: string,
+    resourceName: string,
+    runStartedAt: Date,
+    cursor: string | null,
+    pageCursor: string | null,
+    params?: ProcessNextParams
+  ): Promise<ProcessNextResult> {
+    const batchSize = this.config.maxConcurrentCustomers ?? 10
+
+    try {
+      // Fetch the next batch of customers from the local DB
+      const customerBatch = await this.findNextCustomerBatchForPmSync(
+        accountId,
+        pageCursor,
+        cursor,
+        batchSize
+      )
+
+      // No more customers to process
+      if (customerBatch.length === 0) {
+        await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
+        return { processed: 0, hasMore: false, runStartedAt }
+      }
+
+      this.config.logger?.info(
+        `processNext: fetching payment_methods for ${customerBatch.length} customers`
+      )
+
+      // Fetch PMs for all customers in the batch concurrently.
+      // Each customer's PMs are fully drained (paginated) within this call.
+      let totalProcessed = 0
+      await Promise.all(
+        customerBatch.map(async (customer) => {
+          const allPms: Stripe.PaymentMethod[] = []
+          let hasMore = true
+          let startingAfter: string | undefined
+
+          while (hasMore) {
+            const response = await this.stripe.paymentMethods.list({
+              customer: customer.id,
+              limit: 100,
+              ...(startingAfter ? { starting_after: startingAfter } : {}),
+            })
+
+            allPms.push(...response.data)
+            hasMore = response.has_more
+            if (response.data.length > 0) {
+              startingAfter = response.data[response.data.length - 1].id
+            }
+          }
+
+          if (allPms.length > 0) {
+            await this.upsertPaymentMethods(allPms, accountId, params?.backfillRelatedEntities)
+            totalProcessed += allPms.length
+          }
+        })
+      )
+
+      // Update progress
+      if (totalProcessed > 0) {
+        await this.postgresClient.incrementObjectProgress(
+          accountId,
+          runStartedAt,
+          resourceName,
+          totalProcessed
+        )
+      }
+
+      // Update cursor to max created timestamp from this batch.
+      // updateObjectCursor uses GREATEST for numeric cursors, so it only advances.
+      const maxCreated = Math.max(...customerBatch.map((c) => c.created).filter((c) => c != null))
+      if (maxCreated > 0) {
+        await this.postgresClient.updateObjectCursor(
+          accountId,
+          runStartedAt,
+          resourceName,
+          String(maxCreated)
+        )
+      }
+
+      // Update pageCursor to last customer ID in the batch
+      const lastCustomerId = customerBatch[customerBatch.length - 1].id
+
+      // Check if there are more customers after this batch
+      const nextBatch = await this.findNextCustomerBatchForPmSync(
+        accountId,
+        lastCustomerId,
+        cursor,
+        1
+      )
+      if (nextBatch.length > 0) {
+        await this.postgresClient.updateObjectPageCursor(
+          accountId,
+          runStartedAt,
+          resourceName,
+          lastCustomerId
+        )
+        return { processed: totalProcessed, hasMore: true, runStartedAt }
+      }
+
+      // No more customers — complete
+      await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
+      return { processed: totalProcessed, hasMore: false, runStartedAt }
+    } catch (error) {
+      await this.postgresClient.failObjectSync(
+        accountId,
+        runStartedAt,
+        resourceName,
+        error instanceof Error ? error.message : 'Unknown error'
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Fetch the next batch of non-deleted customers for PM sync.
+   * Returns customer IDs and created timestamps, ordered by id ASC.
+   */
+  private async findNextCustomerBatchForPmSync(
+    accountId: string,
+    afterCustomerId: string | null,
+    cursor: string | null,
+    limit: number
+  ): Promise<Array<{ id: string; created: number }>> {
+    let query = `SELECT id, created FROM stripe.customers WHERE _account_id = $1 AND COALESCE(deleted, false) <> true`
+    const params: (string | number)[] = [accountId]
+
+    if (afterCustomerId) {
+      params.push(afterCustomerId)
+      query += ` AND id > $${params.length}`
+    }
+
+    if (cursor && /^\d+$/.test(cursor)) {
+      params.push(Number.parseInt(cursor, 10))
+      query += ` AND created >= $${params.length}`
+    }
+
+    params.push(limit)
+    query += ` ORDER BY id ASC LIMIT $${params.length}`
+
+    const result = await this.postgresClient.query(query, params)
+    return result.rows as Array<{ id: string; created: number }>
+  }
+
+  /**
+   * Fetch one page of events from the Stripe Events API and reconcile affected entities.
+   *
+   * Instead of replaying events (which can resurrect deleted objects due to newest-first ordering),
+   * we deduplicate by entity and re-fetch current state from Stripe for each affected entity.
+   *
+   * Cursor: event `created` timestamp. On first run, starts from the sync run's startedAt.
+   * On subsequent runs, picks up where the last completed run left off.
+   */
+  private async fetchOnePageEventCatchup(
+    accountId: string,
+    resourceName: string,
+    runStartedAt: Date,
+    cursor: string | null,
+    pageCursor: string | null
+  ): Promise<ProcessNextResult> {
+    try {
+      // Determine the created.gte filter
+      let createdGte: number
+      if (cursor && /^\d+$/.test(cursor)) {
+        createdGte = Number.parseInt(cursor, 10)
+      } else {
+        // First run: start from the sync run's startedAt
+        createdGte = Math.floor(runStartedAt.getTime() / 1000)
+      }
+
+      // Stripe retains events for 30 days — clamp if older
+      const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60
+      if (createdGte < thirtyDaysAgo) {
+        this.config.logger?.warn(
+          `_event_catchup: cursor ${createdGte} is older than 30 days, clamping to ${thirtyDaysAgo}`
+        )
+        createdGte = thirtyDaysAgo
+      }
+
+      // Fetch events from Stripe
+      const listParams: Stripe.EventListParams = {
+        limit: 100,
+        created: { gte: createdGte },
+      }
+      if (pageCursor) {
+        listParams.starting_after = pageCursor
+      }
+
+      const response = await this.stripe.events.list(listParams)
+
+      // Empty page — persist cursor to advance the window, then complete
+      if (response.data.length === 0) {
+        await this.postgresClient.updateObjectCursor(
+          accountId,
+          runStartedAt,
+          resourceName,
+          String(createdGte)
+        )
+        await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
+        return { processed: 0, hasMore: false, runStartedAt }
+      }
+
+      // Deduplicate by entity: keep only the latest event per (objectType, entityId)
+      const entityMap = new Map<string, Stripe.Event>()
+      for (const event of response.data) {
+        const obj = event.data.object as { id?: string; object?: string }
+        if (!obj?.id || !obj?.object) continue
+
+        const key = `${obj.object}:${obj.id}`
+        const existing = entityMap.get(key)
+        if (!existing || event.created > existing.created) {
+          entityMap.set(key, event)
+        }
+      }
+
+      // Event types that represent actual hard deletes in our DB.
+      // Other *.deleted events (e.g. customer.subscription.deleted, invoice.deleted)
+      // represent state changes and should be handled via re-fetch + upsert.
+      const hardDeleteEventTypes = new Set([
+        'product.deleted',
+        'price.deleted',
+        'plan.deleted',
+        'customer.deleted',
+        'customer.tax_id.deleted',
+      ])
+
+      // Process each unique entity
+      let processed = 0
+      let skipped = 0
+      for (const [, event] of entityMap) {
+        const obj = event.data.object as { id: string; object: string }
+        const eventType = event.type
+
+        try {
+          // For non-delete events, check if we already have a more recent version.
+          // If _last_synced_at >= event.created, the entity was updated after this
+          // event — skip the Stripe API retrieve call.
+          if (!hardDeleteEventTypes.has(eventType)) {
+            const tableName = eventObjectTypeToTable(obj.object)
+            if (tableName) {
+              const localRecord = await this.postgresClient.query(
+                `SELECT "_last_synced_at" FROM stripe."${tableName}"
+                 WHERE id = $1 AND "_account_id" = $2 LIMIT 1`,
+                [obj.id, accountId]
+              )
+              if (localRecord.rows.length > 0 && localRecord.rows[0]._last_synced_at != null) {
+                const syncedAt = new Date(localRecord.rows[0]._last_synced_at).getTime() / 1000
+                if (syncedAt >= event.created) {
+                  skipped++
+                  continue
+                }
+              }
+            }
+          }
+
+          if (hardDeleteEventTypes.has(eventType)) {
+            // Use existing delete handlers for true hard deletes
+            await this.handleEventCatchupDelete(obj.object, obj.id, accountId)
+          } else {
+            // Re-fetch current state from Stripe and upsert
+            await this.handleEventCatchupUpsert(obj.object, obj.id, accountId)
+          }
+          processed++
+        } catch (err) {
+          // Log and continue — individual entity errors shouldn't stop the catchup
+          const errMsg = err instanceof Error ? err.message : String(err)
+          this.config.logger?.warn(
+            `_event_catchup: failed to process ${obj.object}:${obj.id} (event ${event.id}): ${errMsg}`
+          )
+        }
+      }
+
+      if (skipped > 0) {
+        this.config.logger?.info(
+          `_event_catchup: skipped ${skipped} entities already up-to-date, processed ${processed}`
+        )
+      }
+
+      // Update progress
+      if (processed > 0) {
+        await this.postgresClient.incrementObjectProgress(
+          accountId,
+          runStartedAt,
+          resourceName,
+          processed
+        )
+      }
+
+      // Update cursor to max created from this page
+      const maxCreated = Math.max(...response.data.map((e) => e.created))
+      await this.postgresClient.updateObjectCursor(
+        accountId,
+        runStartedAt,
+        resourceName,
+        String(maxCreated)
+      )
+
+      // Update pageCursor to last event ID for pagination
+      const lastEventId = response.data[response.data.length - 1].id
+      if (response.has_more) {
+        await this.postgresClient.updateObjectPageCursor(
+          accountId,
+          runStartedAt,
+          resourceName,
+          lastEventId
+        )
+      }
+
+      if (!response.has_more) {
+        await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
+      }
+
+      return { processed, hasMore: response.has_more, runStartedAt }
+    } catch (error) {
+      await this.postgresClient.failObjectSync(
+        accountId,
+        runStartedAt,
+        resourceName,
+        error instanceof Error ? error.message : 'Unknown error'
+      )
+      throw error
+    }
+  }
+
+  /**
+   * Handle a delete for an entity discovered via event catch-up.
+   * Maps Stripe object types to the appropriate delete method.
+   */
+  private async handleEventCatchupDelete(
+    objectType: string,
+    entityId: string,
+    accountId: string
+  ): Promise<void> {
+    switch (objectType) {
+      case 'product':
+        await this.deleteProduct(entityId)
+        break
+      case 'price':
+        await this.deletePrice(entityId)
+        break
+      case 'plan':
+        await this.deletePlan(entityId)
+        break
+      case 'customer': {
+        const deletedCustomer: Stripe.DeletedCustomer = {
+          id: entityId,
+          object: 'customer',
+          deleted: true,
+        }
+        await this.upsertCustomers([deletedCustomer], accountId)
+        break
+      }
+      case 'tax_id':
+        await this.deleteTaxId(entityId)
+        break
+      default:
+        this.config.logger?.warn(
+          `_event_catchup: no delete handler for object type "${objectType}", skipping ${entityId}`
+        )
+    }
+  }
+
+  /**
+   * Handle an upsert for an entity discovered via event catch-up.
+   * Re-fetches the current state from Stripe and upserts it.
+   * If the entity has been deleted (404), falls back to the delete handler.
+   */
+  private async handleEventCatchupUpsert(
+    objectType: string,
+    entityId: string,
+    accountId: string
+  ): Promise<void> {
+    try {
+      switch (objectType) {
+        case 'product': {
+          const product = await this.stripe.products.retrieve(entityId)
+          await this.upsertProducts([product], accountId)
+          break
+        }
+        case 'price': {
+          const price = await this.stripe.prices.retrieve(entityId)
+          await this.upsertPrices([price], accountId)
+          break
+        }
+        case 'plan': {
+          const plan = await this.stripe.plans.retrieve(entityId)
+          await this.upsertPlans([plan], accountId)
+          break
+        }
+        case 'customer': {
+          const customer = await this.stripe.customers.retrieve(entityId)
+          await this.upsertCustomers([customer], accountId)
+          break
+        }
+        case 'subscription': {
+          const sub = await this.stripe.subscriptions.retrieve(entityId)
+          await this.upsertSubscriptions([sub], accountId)
+          break
+        }
+        case 'subscription_schedule': {
+          const schedule = await this.stripe.subscriptionSchedules.retrieve(entityId)
+          await this.upsertSubscriptionSchedules([schedule], accountId)
+          break
+        }
+        case 'invoice': {
+          const invoice = await this.stripe.invoices.retrieve(entityId)
+          await this.upsertInvoices([invoice], accountId)
+          break
+        }
+        case 'charge': {
+          const charge = await this.stripe.charges.retrieve(entityId, {
+            expand: ['balance_transaction'],
+          })
+          if (charge.balance_transaction && typeof charge.balance_transaction === 'object') {
+            await this.upsertBalanceTransactions(
+              [charge.balance_transaction as Stripe.BalanceTransaction],
+              accountId
+            )
+          }
+          await this.upsertCharges([charge], accountId)
+          break
+        }
+        case 'payment_intent': {
+          const pi = await this.stripe.paymentIntents.retrieve(entityId)
+          await this.upsertPaymentIntents([pi], accountId)
+          break
+        }
+        case 'payment_method': {
+          const pm = await this.stripe.paymentMethods.retrieve(entityId)
+          await this.upsertPaymentMethods([pm], accountId)
+          break
+        }
+        case 'setup_intent': {
+          const si = await this.stripe.setupIntents.retrieve(entityId)
+          await this.upsertSetupIntents([si], accountId)
+          break
+        }
+        case 'dispute': {
+          const dispute = await this.stripe.disputes.retrieve(entityId, {
+            expand: ['balance_transactions'],
+          })
+          if (dispute.balance_transactions && Array.isArray(dispute.balance_transactions)) {
+            const expandedBts = dispute.balance_transactions.filter(
+              (bt): bt is Stripe.BalanceTransaction => typeof bt === 'object'
+            )
+            if (expandedBts.length > 0) {
+              await this.upsertBalanceTransactions(expandedBts, accountId)
+            }
+          }
+          await this.upsertDisputes([dispute], accountId)
+          break
+        }
+        case 'credit_note': {
+          const cn = await this.stripe.creditNotes.retrieve(entityId)
+          await this.upsertCreditNotes([cn], accountId)
+          break
+        }
+        case 'refund': {
+          const refund = await this.stripe.refunds.retrieve(entityId, {
+            expand: ['balance_transaction'],
+          })
+          if (refund.balance_transaction && typeof refund.balance_transaction === 'object') {
+            await this.upsertBalanceTransactions(
+              [refund.balance_transaction as Stripe.BalanceTransaction],
+              accountId
+            )
+          }
+          await this.upsertRefunds([refund], accountId)
+          break
+        }
+        case 'tax_id': {
+          const taxId = await this.stripe.taxIds.retrieve(entityId)
+          await this.upsertTaxIds([taxId], accountId)
+          break
+        }
+        case 'balance_transaction': {
+          const bt = await this.stripe.balanceTransactions.retrieve(entityId)
+          await this.upsertBalanceTransactions([bt], accountId)
+          break
+        }
+        case 'checkout.session': {
+          const session = await this.stripe.checkout.sessions.retrieve(entityId)
+          await this.upsertCheckoutSessions([session], accountId)
+          break
+        }
+        case 'radar.early_fraud_warning': {
+          const efw = await this.stripe.radar.earlyFraudWarnings.retrieve(entityId)
+          await this.upsertEarlyFraudWarning([efw], accountId)
+          break
+        }
+        default:
+          this.config.logger?.warn(
+            `_event_catchup: no upsert handler for object type "${objectType}", skipping ${entityId}`
+          )
+      }
+    } catch (err) {
+      // If the entity was deleted from Stripe (404), fall back to delete handler.
+      // Stripe throws StripeInvalidRequestError for 404s, but also check StripeAPIError
+      // for robustness across SDK versions.
+      const isNotFound =
+        (err instanceof Stripe.errors.StripeInvalidRequestError ||
+          err instanceof Stripe.errors.StripeAPIError) &&
+        ((err as { code?: string }).code === 'resource_missing' ||
+          (err as { statusCode?: number }).statusCode === 404)
+      if (isNotFound) {
+        this.config.logger?.info(
+          `_event_catchup: ${objectType}:${entityId} not found on Stripe, treating as deleted`
+        )
+        await this.handleEventCatchupDelete(objectType, entityId, accountId)
+        return
+      }
+      throw err
+    }
+  }
+
+  /**
    * Process all pages for all (or specified) object types until complete.
    *
    * @param params - Optional parameters for filtering and specifying object types
@@ -1628,6 +2166,8 @@ export class StripeSync {
     object: Exclude<SyncObject, 'all' | 'customer_with_entitlements'>,
     result: Sync
   ): void {
+    if (object === '_event_catchup') return
+
     if (this.isSigmaResource(object)) {
       results.sigma = results.sigma ?? {}
       results.sigma[object] = result
@@ -1635,8 +2175,6 @@ export class StripeSync {
       ;(results as Record<string, Sync>)[camelKey] = result
       return
     }
-
-    // TODO: obj === 'payment_methods' reqiores special handling
 
     switch (object) {
       case 'product':
@@ -1665,6 +2203,9 @@ export class StripeSync {
         break
       case 'setup_intent':
         results.setupIntents = result
+        break
+      case 'payment_method':
+        results.paymentMethods = result
         break
       case 'payment_intent':
         results.paymentIntents = result
@@ -3702,4 +4243,32 @@ function chunkArray<T>(array: T[], chunkSize: number): T[][] {
     result.push(array.slice(i, i + chunkSize))
   }
   return result
+}
+
+/**
+ * Map Stripe event object types to local DB table names.
+ * Returns null for object types we don't track.
+ */
+function eventObjectTypeToTable(objectType: string): string | null {
+  const mapping: Record<string, string> = {
+    product: 'products',
+    price: 'prices',
+    plan: 'plans',
+    customer: 'customers',
+    subscription: 'subscriptions',
+    subscription_schedule: 'subscription_schedules',
+    invoice: 'invoices',
+    charge: 'charges',
+    balance_transaction: 'balance_transactions',
+    payment_intent: 'payment_intents',
+    payment_method: 'payment_methods',
+    setup_intent: 'setup_intents',
+    dispute: 'disputes',
+    credit_note: 'credit_notes',
+    refund: 'refunds',
+    tax_id: 'tax_ids',
+    'checkout.session': 'checkout_sessions',
+    'radar.early_fraud_warning': 'early_fraud_warnings',
+  }
+  return mapping[objectType] ?? null
 }
