@@ -1,6 +1,6 @@
 {
   "name": "@paymentsdb/sync-engine",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": false,
   "description": "Stripe Sync Engine to sync Stripe data to Postgres",
   "type": "module",
