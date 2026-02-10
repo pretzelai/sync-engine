@@ -1297,6 +1297,12 @@ export class StripeSync {
       return this.fetchOnePagePaymentMethods(accountId, resourceName, runStartedAt, cursor, pageCursor, params)
     }
 
+    // Tax IDs require read_only scope which may not be available for connected accounts
+    if (object === 'tax_id') {
+      await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
+      return { processed: 0, hasMore: false, runStartedAt }
+    }
+
     // Events catch-up uses its own fetch strategy
     if (object === '_event_catchup') {
       return this.fetchOnePageEventCatchup(accountId, resourceName, runStartedAt, cursor, pageCursor)
@@ -1776,9 +1782,14 @@ export class StripeSync {
       // Process each unique entity
       let processed = 0
       let skipped = 0
+      // Object types to skip in event catch-up (e.g. missing API permissions)
+      const skipObjectTypes = new Set(['tax_id'])
+
       for (const [, event] of entityMap) {
         const obj = event.data.object as { id: string; object: string }
         const eventType = event.type
+
+        if (skipObjectTypes.has(obj.object)) continue
 
         try {
           // For non-delete events, check if we already have a more recent version.
