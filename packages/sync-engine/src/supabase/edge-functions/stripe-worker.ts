@@ -100,9 +100,37 @@ Deno.serve(async (req) => {
       SELECT * FROM pgmq.read(${QUEUE_NAME}::text, ${VISIBILITY_TIMEOUT}::int, ${BATCH_SIZE}::int)
     `
 
-    // If queue empty, enqueue all objects for continuous sync
+    // If no visible messages, check whether messages are still in-flight
+    // (invisible due to VT) before treating the queue as truly empty.
     if (messages.length === 0) {
-      // Create sync run to make enqueued work visible (status='pending')
+      const [{ queue_length }] =
+        await sql`SELECT queue_length FROM pgmq.metrics(${QUEUE_NAME}::text)`
+      if (queue_length > 0) {
+        return new Response(JSON.stringify({ skipped: true, reason: 'messages still in flight' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      // Queue is genuinely empty. If cron is in fast mode (sub-minute) and
+      // the initial sync has completed (at least one closed run), downgrade
+      // to steady-state interval (once per minute).
+      const [{ schedule }] =
+        await sql`SELECT schedule FROM cron.job WHERE jobname = 'stripe-sync-worker'`
+      if (schedule !== '*/1 * * * *') {
+        const [{ n }] =
+          await sql`SELECT count(*)::int as n FROM stripe._sync_runs WHERE closed_at IS NOT NULL`
+        if (n > 0) {
+          await sql`
+            SELECT cron.alter_job(
+              (SELECT jobid FROM cron.job WHERE jobname = 'stripe-sync-worker'),
+              schedule := '*/1 * * * *'
+            )
+          `
+        }
+      }
+
+      // Enqueue all objects for the next sync cycle
       const { objects } = await stripeSync.joinOrCreateSyncRun('worker')
       const msgs = objects.map((object) => JSON.stringify({ object }))
 

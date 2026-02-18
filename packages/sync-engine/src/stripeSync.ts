@@ -155,7 +155,7 @@ export class StripeSync {
       },
       subscription: {
         order: 5, // Depends on customer, price
-        listFn: (p) => this.stripe.subscriptions.list(p),
+        listFn: (p) => this.stripe.subscriptions.list({ status: 'all', ...p }),
         upsertFn: (items, id, bf) =>
           this.upsertSubscriptions(items as Stripe.Subscription[], id, bf),
         supportsCreatedFilter: true,
