@@ -1249,6 +1249,34 @@ export class StripeSync {
   }
 
   /**
+   * Check if an error is a credential/authentication error.
+   * These errors should be treated as temporary and retried on next cron,
+   * rather than marking the object as failed.
+   */
+  private isCredentialError(error: unknown): boolean {
+    if (error instanceof Stripe.errors.StripeAuthenticationError) {
+      return true
+    }
+    if (error instanceof Error) {
+      const message = error.message.toLowerCase()
+      if (
+        message.includes('api key') &&
+        (message.includes('expired') || message.includes('invalid'))
+      ) {
+        return true
+      }
+      if (message.includes('platform access may have been revoked')) {
+        return true
+      }
+    }
+    const statusCode = (error as { statusCode?: number })?.statusCode
+    if (statusCode === 401) {
+      return true
+    }
+    return false
+  }
+
+  /**
    * Get the database resource name for a SyncObject type
    */
   private getResourceName(object: SyncObject): string {
@@ -1408,6 +1436,18 @@ export class StripeSync {
         runStartedAt,
       }
     } catch (error) {
+      // Credential errors: don't mark as failed, just touch to prevent stale cancellation.
+      // The object stays in 'running' state and will be retried on next cron with fresh creds.
+      if (this.isCredentialError(error)) {
+        this.config.logger?.warn(
+          { error, resourceName },
+          'Credential error during sync, will retry on next cron'
+        )
+        await this.postgresClient.touchObjectRun(accountId, runStartedAt, resourceName)
+        throw error
+      }
+
+      // Other errors: mark as failed (page_cursor is preserved for resume)
       await this.postgresClient.failObjectSync(
         accountId,
         runStartedAt,

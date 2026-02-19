@@ -490,8 +490,7 @@ export class PostgresClient {
       `UPDATE "${this.config.schema}"."_sync_obj_runs" o
        SET status = 'error',
            error_message = 'Auto-cancelled: stale (no update in 5 min)',
-           completed_at = now(),
-           page_cursor = NULL
+           completed_at = now()
        WHERE o."_account_id" = $1
          AND o.status = 'running'
          AND o.updated_at < now() - interval '5 minutes'`,
@@ -762,6 +761,23 @@ export class PostgresClient {
   }
 
   /**
+   * Touch an object run to update its timestamp (prevents stale cancellation).
+   * Use this when you want to signal the object is still active without changing progress.
+   */
+  async touchObjectRun(
+    accountId: string,
+    runStartedAt: Date,
+    object: string
+  ): Promise<void> {
+    await this.query(
+      `UPDATE "${this.config.schema}"."_sync_obj_runs"
+       SET updated_at = now()
+       WHERE "_account_id" = $1 AND run_started_at = $2 AND object = $3`,
+      [accountId, runStartedAt, object]
+    )
+  }
+
+  /**
    * Update the pagination page_cursor used for backfills using Stripe list calls.
    */
   async updateObjectPageCursor(
@@ -989,7 +1005,7 @@ export class PostgresClient {
   ): Promise<void> {
     await this.query(
       `UPDATE "${this.config.schema}"."_sync_obj_runs"
-       SET status = 'error', error_message = $4, completed_at = now(), page_cursor = NULL
+       SET status = 'error', error_message = $4, completed_at = now()
        WHERE "_account_id" = $1 AND run_started_at = $2 AND object = $3`,
       [accountId, runStartedAt, object, errorMessage]
     )

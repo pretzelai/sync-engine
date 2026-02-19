@@ -9,9 +9,9 @@ export interface RetryConfig {
 }
 
 const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  maxRetries: 5,
+  maxRetries: 3,
   initialDelayMs: 1000, // 1 second
-  maxDelayMs: 60000, // 60 seconds
+  maxDelayMs: 10000, // 10 seconds (must fit within edge function's 60s limit)
   jitterMs: 500, // randomization to prevent thundering herd
 }
 
@@ -97,15 +97,14 @@ function calculateDelay(
   config: RetryConfig,
   retryAfterMs?: number | null
 ): number {
-  // If Stripe provided Retry-After header, trust it
+  // If Stripe provided Retry-After header, use it but cap to maxDelayMs
   if (retryAfterMs !== null && retryAfterMs !== undefined) {
-    // Still add jitter to prevent thundering herd
+    const capped = Math.min(retryAfterMs, config.maxDelayMs)
     const jitter = Math.random() * config.jitterMs
-    return retryAfterMs + jitter
+    return capped + jitter
   }
 
-  // Fall back to exponential backoff
-  // Exponential: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped at maxDelay)
+  // Fall back to exponential backoff (capped at maxDelay)
   const exponentialDelay = Math.min(config.initialDelayMs * Math.pow(2, attempt), config.maxDelayMs)
 
   // Add random jitter to prevent thundering herd problem

@@ -7,6 +7,8 @@ import {
 } from './edge-function-code'
 import pkg from '../../package.json' with { type: 'json' }
 
+export const SYNC_ENGINE_VERSION = pkg.version
+
 export const STRIPE_SCHEMA_COMMENT_PREFIX = 'stripe-sync'
 export const INSTALLATION_STARTED_SUFFIX = 'installation:started'
 export const INSTALLATION_ERROR_SUFFIX = 'installation:error'
@@ -461,6 +463,116 @@ export class SupabaseSetupClient {
       /from ['"]npm:@paymentsdb\/sync-engine['"]/g,
       `from 'npm:@paymentsdb/sync-engine@${version}'`
     )
+  }
+
+  /**
+   * Check if a specific Edge Function exists
+   */
+  async functionExists(name: string): Promise<boolean> {
+    const functions = await this.api.listFunctions(this.projectRef)
+    return functions?.some((f) => f.slug === name) ?? false
+  }
+
+  /**
+   * Upgrade Edge Functions to a new version.
+   *
+   * This is a lightweight upgrade path that:
+   * - Redeploys all edge functions with versioned imports
+   * - Optionally runs migrations via stripe-setup POST
+   * - Updates schema comment with new version
+   *
+   * Unlike install(), this does NOT:
+   * - Set secrets (they're already configured)
+   * - Create cron jobs (they're already running)
+   * - Do initial schema setup
+   *
+   * Safety during upgrade:
+   * - In-flight requests complete with old code
+   * - New requests get new code after deployment
+   * - Brief unavailability (~1s) may cause one cron cycle to skip
+   * - All components are idempotent and retry-safe
+   *
+   * @param options.runMigrations - If true, invoke stripe-setup to run any pending migrations (default: true)
+   * @param options.packageVersion - Version to use for imports (default: current package version)
+   * @param options.enableSigma - If true, force upgrade sigma-data-worker even if not present (default: auto-detect)
+   * @returns Object with upgraded functions and version info
+   */
+  async upgradeEdgeFunctions(options?: {
+    runMigrations?: boolean
+    packageVersion?: string
+    enableSigma?: boolean
+  }): Promise<{
+    success: boolean
+    upgradedFunctions: string[]
+    version: string
+    migrationsRun: boolean
+  }> {
+    const runMigrations = options?.runMigrations ?? true
+    const version = options?.packageVersion ?? pkg.version
+
+    const upgradedFunctions: string[] = []
+
+    try {
+      // Validate project access
+      await this.validateProject()
+
+      // Auto-detect if sigma-data-worker exists (unless explicitly specified)
+      let shouldUpgradeSigma = options?.enableSigma
+      if (shouldUpgradeSigma === undefined) {
+        shouldUpgradeSigma = await this.functionExists('sigma-data-worker')
+      }
+
+      // Deploy Edge Functions with specified package version
+      const versionedSetup = this.injectPackageVersion(setupFunctionCode, version)
+      const versionedWebhook = this.injectPackageVersion(webhookFunctionCode, version)
+      const versionedWorker = this.injectPackageVersion(workerFunctionCode, version)
+
+      await this.deployFunction('stripe-setup', versionedSetup, false)
+      upgradedFunctions.push('stripe-setup')
+
+      await this.deployFunction('stripe-webhook', versionedWebhook, false)
+      upgradedFunctions.push('stripe-webhook')
+
+      await this.deployFunction('stripe-worker', versionedWorker, false)
+      upgradedFunctions.push('stripe-worker')
+
+      // Deploy sigma worker if it exists or was explicitly requested
+      if (shouldUpgradeSigma) {
+        const versionedSigmaWorker = this.injectPackageVersion(sigmaWorkerFunctionCode, version)
+        await this.deployFunction('sigma-data-worker', versionedSigmaWorker, false)
+        upgradedFunctions.push('sigma-data-worker')
+      }
+
+      // Optionally run migrations via stripe-setup POST
+      let migrationsRun = false
+      if (runMigrations) {
+        const setupResult = await this.invokeFunction('stripe-setup', this.accessToken)
+        if (!setupResult.success) {
+          throw new Error(`Migration failed: ${setupResult.error}`)
+        }
+        migrationsRun = true
+      }
+
+      // Update schema comment with new version
+      await this.updateInstallationComment(
+        `${STRIPE_SCHEMA_COMMENT_PREFIX} v${version} ${INSTALLATION_INSTALLED_SUFFIX}`
+      )
+
+      return {
+        success: true,
+        upgradedFunctions,
+        version,
+        migrationsRun,
+      }
+    } catch (error) {
+      // Log error but include partial success info
+      console.error('Edge function upgrade failed:', error)
+      throw new Error(
+        `Upgrade failed after deploying ${upgradedFunctions.length} functions: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
   }
 
   async install(
