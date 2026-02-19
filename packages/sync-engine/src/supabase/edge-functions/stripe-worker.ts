@@ -94,11 +94,15 @@ Deno.serve(async (req) => {
       debug: (...args: unknown[]) => { if (DEBUG) console.log('[DEBUG]', ...args) },
     }
 
+    // Enable backfill by default (can be disabled via env var BACKFILL_RELATED_ENTITIES=false)
+    const backfillRelatedEntities = Deno.env.get('BACKFILL_RELATED_ENTITIES') !== 'false'
+
     stripeSync = new StripeSync({
       poolConfig: { connectionString: dbUrl, max: 1 },
       stripeSecretKey: Deno.env.get('STRIPE_SECRET_KEY')!,
       enableSigma: (Deno.env.get('ENABLE_SIGMA') ?? 'false') === 'true',
       appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
+      backfillRelatedEntities,
       logger,
       debug: DEBUG,
     })

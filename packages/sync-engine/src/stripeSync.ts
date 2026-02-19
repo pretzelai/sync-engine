@@ -3755,9 +3755,31 @@ export class StripeSync {
 
   backfillPrices = async (priceIds: string[], accountId: string) => {
     const missingIds = await this.postgresClient.findMissingEntries('prices', priceIds)
-    await this.fetchMissingEntities(missingIds, (id) => this.stripe.prices.retrieve(id)).then(
-      (entries) => this.upsertPrices(entries, accountId)
-    )
+
+    if (this.config.debug) {
+      this.config.logger?.info({
+        msg: '[backfillPrices] Checking for missing prices',
+        requestedCount: priceIds.length,
+        missingCount: missingIds.length,
+        missingIds: missingIds,
+      })
+    }
+
+    if (missingIds.length > 0) {
+      const entries = await this.fetchMissingEntities(missingIds, (id) =>
+        this.stripe.prices.retrieve(id)
+      )
+
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: '[backfillPrices] Fetched missing prices from Stripe via retrieve()',
+          fetchedCount: entries.length,
+          fetchedIds: entries.map((e) => e.id),
+        })
+      }
+
+      await this.upsertPrices(entries, accountId)
+    }
   }
 
   async upsertPlans(
@@ -4084,15 +4106,41 @@ export class StripeSync {
     backfillRelatedEntities?: boolean,
     syncTimestamp?: string
   ): Promise<Stripe.Subscription[]> {
-    if (backfillRelatedEntities ?? this.config.backfillRelatedEntities) {
-      const customerIds = getUniqueIds(subscriptions, 'customer')
+    const shouldBackfill = backfillRelatedEntities ?? this.config.backfillRelatedEntities
 
+    if (shouldBackfill) {
+      const customerIds = getUniqueIds(subscriptions, 'customer')
       await this.backfillCustomers(customerIds, accountId)
     }
 
     await this.expandEntity(subscriptions, 'items', (id) =>
       this.stripe.subscriptionItems.list({ subscription: id, limit: 100 })
     )
+
+    // Collect all subscription items (used for backfill check and later upsert)
+    const allSubscriptionItems = subscriptions.flatMap((subscription) => subscription.items.data)
+
+    // Backfill prices referenced by subscription items (handles inline prices that don't appear in prices.list())
+    if (shouldBackfill) {
+      const priceIds = allSubscriptionItems
+        .map((item) => item.price?.id)
+        .filter((id): id is string => Boolean(id))
+      const uniquePriceIds = [...new Set(priceIds)]
+
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: '[upsertSubscriptions] Backfilling prices from subscription items',
+          subscriptionCount: subscriptions.length,
+          subscriptionItemCount: allSubscriptionItems.length,
+          uniquePriceIds: uniquePriceIds.length,
+          priceIds: uniquePriceIds,
+        })
+      }
+
+      if (uniquePriceIds.length > 0) {
+        await this.backfillPrices(uniquePriceIds, accountId)
+      }
+    }
 
     // Run it
     const rows = await this.postgresClient.upsertManyWithTimestampProtection(
@@ -4104,7 +4152,6 @@ export class StripeSync {
 
     // Upsert subscription items into a separate table
     // need to run after upsert subscription cos subscriptionItems will reference the subscription
-    const allSubscriptionItems = subscriptions.flatMap((subscription) => subscription.items.data)
     await this.upsertSubscriptionItems(allSubscriptionItems, accountId, syncTimestamp)
 
     // We have to mark existing subscription item in db as deleted
