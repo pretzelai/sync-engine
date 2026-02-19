@@ -131,13 +131,65 @@ export class StripeSync {
     const core: Record<string, ResourceConfig> = {
       product: {
         order: 1, // No dependencies
-        listFn: (p) => this.stripe.products.list(p),
+        listFn: async (p) => {
+          // Phase-aware listing: active phase first, then inactive phase
+          const PHASE_PREFIX = '__phase:inactive'
+          let phase: 'active' | 'inactive' = 'active'
+          let realStartingAfter = p.starting_after
+
+          if (p.starting_after?.startsWith(PHASE_PREFIX)) {
+            phase = 'inactive'
+            const afterPrefix = p.starting_after.slice(PHASE_PREFIX.length)
+            realStartingAfter = afterPrefix.startsWith(':')
+              ? afterPrefix.slice(1) || undefined
+              : undefined
+          }
+
+          const response = await this.stripe.products.list({
+            ...p,
+            starting_after: realStartingAfter,
+            active: phase === 'active',
+          })
+
+          // Signal phase transition when active phase completes
+          if (phase === 'active' && !response.has_more) {
+            return { ...response, _nextPhase: 'inactive' }
+          }
+
+          return response
+        },
         upsertFn: (items, id) => this.upsertProducts(items as Stripe.Product[], id),
         supportsCreatedFilter: true,
       },
       price: {
         order: 2, // Depends on product
-        listFn: (p) => this.stripe.prices.list(p),
+        listFn: async (p) => {
+          // Phase-aware listing: active phase first, then inactive phase
+          const PHASE_PREFIX = '__phase:inactive'
+          let phase: 'active' | 'inactive' = 'active'
+          let realStartingAfter = p.starting_after
+
+          if (p.starting_after?.startsWith(PHASE_PREFIX)) {
+            phase = 'inactive'
+            const afterPrefix = p.starting_after.slice(PHASE_PREFIX.length)
+            realStartingAfter = afterPrefix.startsWith(':')
+              ? afterPrefix.slice(1) || undefined
+              : undefined
+          }
+
+          const response = await this.stripe.prices.list({
+            ...p,
+            starting_after: realStartingAfter,
+            active: phase === 'active',
+          })
+
+          // Signal phase transition when active phase completes
+          if (phase === 'active' && !response.has_more) {
+            return { ...response, _nextPhase: 'inactive' }
+          }
+
+          return response
+        },
         upsertFn: (items, id, bf) => this.upsertPrices(items as Stripe.Price[], id, bf),
         supportsCreatedFilter: true,
       },
@@ -1378,6 +1430,10 @@ export class StripeSync {
       // Fetch from Stripe
       const response = await config.listFn(listParams)
 
+      // Extract phase transition signal and determine current phase
+      const nextPhase = response._nextPhase
+      const phase = pageCursor?.startsWith('__phase:inactive') ? 'inactive' : 'active'
+
       // Defensive: Stripe should not return has_more=true with empty data. Avoid infinite loops by failing this object run if it ever happens.
       if (response.data.length === 0 && response.has_more) {
         const message = `Stripe returned has_more=true with empty page for ${resourceName}. Aborting to avoid infinite loop.`
@@ -1413,19 +1469,31 @@ export class StripeSync {
           )
         }
 
-        // Update pagination page_cursor with last item's ID
+        // Update pagination page_cursor with last item's ID (encode phase if in inactive phase)
         const lastId = (response.data[response.data.length - 1] as { id: string }).id
         if (response.has_more) {
+          const newPageCursor = phase === 'inactive' ? `__phase:inactive:${lastId}` : lastId
           await this.postgresClient.updateObjectPageCursor(
             accountId,
             runStartedAt,
             resourceName,
-            lastId
+            newPageCursor
           )
         }
       }
 
-      // Mark complete if no more pages
+      // Phase transition: active phase finished, switch to inactive phase
+      if (phase === 'active' && !response.has_more && nextPhase === 'inactive') {
+        await this.postgresClient.updateObjectPageCursor(
+          accountId,
+          runStartedAt,
+          resourceName,
+          '__phase:inactive'
+        )
+        return { processed: response.data.length, hasMore: true, runStartedAt }
+      }
+
+      // Mark complete if no more pages (and no pending phase transition)
       if (!response.has_more) {
         await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
       }

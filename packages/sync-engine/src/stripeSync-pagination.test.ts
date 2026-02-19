@@ -418,4 +418,241 @@ describe('Pagination regression tests', () => {
       expect(call4.starting_after).toBeUndefined()
     })
   })
+
+  describe('phase-based sync for prices and products', () => {
+    let sync: StripeSync
+    let mockPricesList: ReturnType<typeof vi.fn>
+    let mockProductsList: ReturnType<typeof vi.fn>
+
+    beforeEach(() => {
+      sync = new StripeSync({
+        stripeSecretKey: 'sk_test_fake',
+        databaseUrl: 'postgresql://fake',
+        poolConfig: {},
+      })
+
+      mockPricesList = vi.fn()
+      mockProductsList = vi.fn()
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(sync.stripe as any).prices = { list: mockPricesList }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(sync.stripe as any).products = { list: mockProductsList }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(sync as any).getCurrentAccount = vi.fn().mockResolvedValue({ id: 'acct_test' })
+
+      sync.postgresClient.getOrCreateSyncRun = vi.fn().mockResolvedValue({
+        accountId: 'acct_test',
+        runStartedAt: new Date(),
+        isNew: true,
+      })
+      sync.postgresClient.createObjectRuns = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: null,
+      })
+      sync.postgresClient.tryStartObjectSync = vi.fn().mockResolvedValue(true)
+      sync.postgresClient.getLastCursorBeforeRun = vi.fn().mockResolvedValue(null)
+      sync.postgresClient.incrementObjectProgress = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.updateObjectCursor = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.updateObjectPageCursor = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.completeObjectSync = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.failObjectSync = vi.fn().mockResolvedValue(undefined)
+      sync.postgresClient.upsertManyWithTimestampProtection = vi.fn().mockResolvedValue([])
+    })
+
+    it('price listFn should pass active:true for active phase', async () => {
+      mockPricesList.mockResolvedValue({
+        data: [{ id: 'price_1', created: 1700000100 }],
+        has_more: false,
+      })
+
+      await sync.processNext('price')
+
+      expect(mockPricesList).toHaveBeenCalledWith(
+        expect.objectContaining({ active: true })
+      )
+    })
+
+    it('price listFn should pass active:false for inactive phase', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive',
+      })
+
+      mockPricesList.mockResolvedValue({
+        data: [{ id: 'price_2', created: 1700000200 }],
+        has_more: false,
+      })
+
+      await sync.processNext('price')
+
+      expect(mockPricesList).toHaveBeenCalledWith(
+        expect.objectContaining({ active: false })
+      )
+      expect(mockPricesList.mock.calls[0][0].starting_after).toBeUndefined()
+    })
+
+    it('price listFn should decode page_cursor for inactive phase continuation', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive:price_abc',
+      })
+
+      mockPricesList.mockResolvedValue({
+        data: [{ id: 'price_def', created: 1700000300 }],
+        has_more: false,
+      })
+
+      await sync.processNext('price')
+
+      expect(mockPricesList).toHaveBeenCalledWith(
+        expect.objectContaining({
+          active: false,
+          starting_after: 'price_abc',
+        })
+      )
+    })
+
+    it('should transition from active to inactive phase when active phase completes', async () => {
+      mockPricesList.mockResolvedValue({
+        data: [{ id: 'price_1', created: 1700000100 }],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('price')
+
+      // Should set marker-only cursor for inactive phase
+      expect(sync.postgresClient.updateObjectPageCursor).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices',
+        '__phase:inactive'
+      )
+      // Should return hasMore: true to trigger re-enqueue
+      expect(result.hasMore).toBe(true)
+      expect(result.processed).toBe(1)
+      // Should NOT complete the object sync yet
+      expect(sync.postgresClient.completeObjectSync).not.toHaveBeenCalled()
+    })
+
+    it('should transition from active to inactive phase even with zero active items', async () => {
+      mockPricesList.mockResolvedValue({
+        data: [],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('price')
+
+      // Should set marker-only cursor for inactive phase
+      expect(sync.postgresClient.updateObjectPageCursor).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices',
+        '__phase:inactive'
+      )
+      expect(result.hasMore).toBe(true)
+      expect(result.processed).toBe(0)
+      expect(sync.postgresClient.completeObjectSync).not.toHaveBeenCalled()
+      // Should NOT fail the sync (the safety check should not trigger)
+      expect(sync.postgresClient.failObjectSync).not.toHaveBeenCalled()
+    })
+
+    it('should encode phase in page_cursor during inactive phase paging', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive',
+      })
+
+      mockPricesList.mockResolvedValue({
+        data: [
+          { id: 'price_inactive_1', created: 1600000100 },
+          { id: 'price_inactive_2', created: 1600000200 },
+        ],
+        has_more: true,
+      })
+
+      const result = await sync.processNext('price')
+
+      expect(sync.postgresClient.updateObjectPageCursor).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices',
+        '__phase:inactive:price_inactive_2'
+      )
+      expect(result.hasMore).toBe(true)
+    })
+
+    it('should complete object sync when inactive phase finishes', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive:price_last',
+      })
+
+      mockPricesList.mockResolvedValue({
+        data: [{ id: 'price_final', created: 1600000300 }],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('price')
+
+      expect(sync.postgresClient.completeObjectSync).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices'
+      )
+      expect(result.hasMore).toBe(false)
+    })
+
+    it('should complete object sync when inactive phase has zero items', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive',
+      })
+
+      mockPricesList.mockResolvedValue({
+        data: [],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('price')
+
+      expect(sync.postgresClient.completeObjectSync).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices'
+      )
+      expect(result.hasMore).toBe(false)
+      expect(sync.postgresClient.failObjectSync).not.toHaveBeenCalled()
+    })
+
+    it('product listFn should follow the same phase pattern as prices', async () => {
+      mockProductsList.mockResolvedValue({
+        data: [{ id: 'prod_1', created: 1700000100 }],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('product')
+
+      // Should pass active:true for active phase
+      expect(mockProductsList).toHaveBeenCalledWith(
+        expect.objectContaining({ active: true })
+      )
+      // Should transition to inactive phase
+      expect(sync.postgresClient.updateObjectPageCursor).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'products',
+        '__phase:inactive'
+      )
+      expect(result.hasMore).toBe(true)
+    })
+  })
 })

@@ -257,6 +257,8 @@ export type StripeListResourceConfig = BaseResourceConfig & {
   listFn: (params: Stripe.PaginationParams & { created?: Stripe.RangeQueryParam }) => Promise<{
     data: unknown[]
     has_more: boolean
+    /** Signals a pending phase transition when has_more is false (e.g., active→inactive for prices/products) */
+    _nextPhase?: string
   }>
   /** Function to upsert items to database */
   upsertFn: (
