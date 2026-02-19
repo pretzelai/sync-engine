@@ -20,7 +20,7 @@
  *   processing on timeout/crash is safe.
  */
 
-import { StripeSync } from 'npm:@paymentsdb/sync-engine'
+import { StripeSync, VERSION } from 'npm:@paymentsdb/sync-engine'
 import postgres from 'npm:postgres'
 
 const QUEUE_NAME = 'stripe_sync_work'
@@ -28,6 +28,7 @@ const VISIBILITY_TIMEOUT = 60 // seconds
 const BATCH_SIZE = 10
 
 Deno.serve(async (req) => {
+  console.log(`[stripe-worker] Starting invocation, sync-engine version: ${VERSION}`)
   const authHeader = req.headers.get('Authorization')
   if (!authHeader?.startsWith('Bearer ')) {
     return new Response('Unauthorized', { status: 401 })
@@ -106,7 +107,7 @@ Deno.serve(async (req) => {
       const [{ queue_length }] =
         await sql`SELECT queue_length FROM pgmq.metrics(${QUEUE_NAME}::text)`
       if (queue_length > 0) {
-        return new Response(JSON.stringify({ skipped: true, reason: 'messages still in flight' }), {
+        return new Response(JSON.stringify({ version: VERSION, skipped: true, reason: 'messages still in flight' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -141,7 +142,7 @@ Deno.serve(async (req) => {
         )
       `
 
-      return new Response(JSON.stringify({ enqueued: objects.length, objects }), {
+      return new Response(JSON.stringify({ version: VERSION, enqueued: objects.length, objects }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -179,13 +180,13 @@ Deno.serve(async (req) => {
       })
     )
 
-    return new Response(JSON.stringify({ results }), {
+    return new Response(JSON.stringify({ version: VERSION, results }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })
   } catch (error) {
     console.error('Worker error:', error)
-    return new Response(JSON.stringify({ error: error.message, stack: error.stack }), {
+    return new Response(JSON.stringify({ version: VERSION, error: error.message, stack: error.stack }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
     })
