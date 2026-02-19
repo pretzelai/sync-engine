@@ -99,6 +99,13 @@ export type StripeSyncConfig = {
   logger?: Logger
 
   /**
+   * Enable verbose debug logging for troubleshooting sync issues.
+   * Logs detailed information about phase transitions, cursors, and Stripe API calls.
+   * Default: false
+   */
+  debug?: boolean
+
+  /**
    * Maximum number of retry attempts for 429 rate limit errors.
    * Default: 5
    */

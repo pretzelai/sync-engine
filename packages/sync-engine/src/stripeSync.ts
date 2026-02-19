@@ -145,11 +145,35 @@ export class StripeSync {
               : undefined
           }
 
-          const response = await this.stripe.products.list({
+          const stripeParams = {
             ...p,
             starting_after: realStartingAfter,
             active: phase === 'active',
-          })
+          }
+
+          if (this.config.debug) {
+            this.config.logger?.info({
+              msg: '[listFn:products] Calling Stripe API',
+              phase,
+              active: stripeParams.active,
+              starting_after: stripeParams.starting_after,
+              created: stripeParams.created,
+              limit: stripeParams.limit,
+            })
+          }
+
+          const response = await this.stripe.products.list(stripeParams)
+
+          if (this.config.debug) {
+            this.config.logger?.info({
+              msg: '[listFn:products] Stripe response',
+              phase,
+              dataCount: response.data.length,
+              hasMore: response.has_more,
+              firstId: response.data[0]?.id,
+              lastId: response.data[response.data.length - 1]?.id,
+            })
+          }
 
           // Signal phase transition when active phase completes
           if (phase === 'active' && !response.has_more) {
@@ -177,11 +201,35 @@ export class StripeSync {
               : undefined
           }
 
-          const response = await this.stripe.prices.list({
+          const stripeParams = {
             ...p,
             starting_after: realStartingAfter,
             active: phase === 'active',
-          })
+          }
+
+          if (this.config.debug) {
+            this.config.logger?.info({
+              msg: '[listFn:prices] Calling Stripe API',
+              phase,
+              active: stripeParams.active,
+              starting_after: stripeParams.starting_after,
+              created: stripeParams.created,
+              limit: stripeParams.limit,
+            })
+          }
+
+          const response = await this.stripe.prices.list(stripeParams)
+
+          if (this.config.debug) {
+            this.config.logger?.info({
+              msg: '[listFn:prices] Stripe response',
+              phase,
+              dataCount: response.data.length,
+              hasMore: response.has_more,
+              firstId: response.data[0]?.id,
+              lastId: response.data[response.data.length - 1]?.id,
+            })
+          }
 
           // Signal phase transition when active phase completes
           if (phase === 'active' && !response.has_more) {
@@ -1215,8 +1263,27 @@ export class StripeSync {
 
       // Check object status and try to claim if pending
       const objRun = await this.postgresClient.getObjectRun(accountId, runStartedAt, resourceName)
+      
+      // Debug logging: show object run state from DB
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: `[processNext:objRunState] ${resourceName}`,
+          object,
+          status: objRun?.status,
+          processedCount: objRun?.processedCount,
+          cursor: objRun?.cursor,
+          pageCursor: objRun?.pageCursor,
+        })
+      }
+      
       if (objRun?.status === 'complete' || objRun?.status === 'error') {
         // Object already finished - return early
+        if (this.config.debug) {
+          this.config.logger?.info({
+            msg: `[processNext:skip] ${resourceName} already ${objRun.status}`,
+            object,
+          })
+        }
         return {
           processed: 0,
           hasMore: false,
@@ -1266,6 +1333,17 @@ export class StripeSync {
       // Sigma paging uses the current run cursor to advance page-by-page.
       if (registryConfig.sigma && objRun?.cursor) {
         cursor = objRun.cursor
+      }
+
+      // Debug logging: show cursor to be used
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: `[processNext:cursor] ${resourceName}`,
+          object,
+          cursorFromLastRun: cursor,
+          pageCursorFromObjRun: objRun?.pageCursor,
+          willCallFetchOnePage: true,
+        })
       }
 
       // Fetch one page and upsert
@@ -1409,12 +1487,30 @@ export class StripeSync {
         )
       }
 
+      // Phase-aware pagination: some listFns encode an inactive phase marker in starting_after.
+      // We must detect phase BEFORE building listParams so we don't apply incremental created filters
+      // to the inactive phase (archived objects can be older than the active cursor).
+      const phase = pageCursor?.startsWith('__phase:inactive') ? 'inactive' : 'active'
+      const isTwoPhaseObject = object === 'price' || object === 'product'
+
+      // Debug logging for phase-aware sync
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: `[fetchOnePage:start] ${resourceName}`,
+          object,
+          phase,
+          isTwoPhaseObject,
+          cursor,
+          pageCursor,
+        })
+      }
+
       // Build list parameters
       const listParams: Stripe.PaginationParams & { created?: Stripe.RangeQueryParam } = { limit }
       if (config.supportsCreatedFilter) {
         const created =
           params?.created ??
-          (cursor && /^\d+$/.test(cursor)
+          (phase === 'active' && cursor && /^\d+$/.test(cursor)
             ? ({ gte: Number.parseInt(cursor, 10) } as const)
             : undefined)
         if (created) {
@@ -1427,12 +1523,32 @@ export class StripeSync {
         listParams.starting_after = pageCursor
       }
 
+      // Debug logging: show exact params being sent to Stripe
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: `[fetchOnePage:listParams] ${resourceName}`,
+          listParams: JSON.stringify(listParams),
+          willApplyCreatedFilter: !!listParams.created,
+          phase,
+        })
+      }
+
       // Fetch from Stripe
       const response = await config.listFn(listParams)
 
-      // Extract phase transition signal and determine current phase
+      // Extract phase transition signal
       const nextPhase = response._nextPhase
-      const phase = pageCursor?.startsWith('__phase:inactive') ? 'inactive' : 'active'
+
+      // Debug logging: show response summary
+      if (this.config.debug) {
+        this.config.logger?.info({
+          msg: `[fetchOnePage:response] ${resourceName}`,
+          dataCount: response.data.length,
+          hasMore: response.has_more,
+          nextPhase,
+          phase,
+        })
+      }
 
       // Defensive: Stripe should not return has_more=true with empty data. Avoid infinite loops by failing this object run if it ever happens.
       if (response.data.length === 0 && response.has_more) {
@@ -1483,7 +1599,23 @@ export class StripeSync {
       }
 
       // Phase transition: active phase finished, switch to inactive phase
-      if (phase === 'active' && !response.has_more && nextPhase === 'inactive') {
+      // For prices/products, we always do an inactive sweep after finishing the active phase.
+      // Relying solely on listFn-provided metadata (_nextPhase) is brittle and can silently
+      // prevent archived objects from ever syncing (especially on upgraded installs with a recent cursor).
+      const shouldTransitionToInactive = phase === 'active' && !response.has_more && (nextPhase === 'inactive' || isTwoPhaseObject)
+      
+      if (shouldTransitionToInactive) {
+        if (this.config.debug || isTwoPhaseObject) {
+          this.config.logger?.info({
+            msg: `[fetchOnePage:PHASE_TRANSITION] ${resourceName} active->inactive`,
+            object,
+            phase,
+            nextPhase,
+            isTwoPhaseObject,
+            processedThisPage: response.data.length,
+            reason: nextPhase === 'inactive' ? 'listFn signaled _nextPhase' : 'isTwoPhaseObject fallback',
+          })
+        }
         await this.postgresClient.updateObjectPageCursor(
           accountId,
           runStartedAt,
@@ -1495,6 +1627,14 @@ export class StripeSync {
 
       // Mark complete if no more pages (and no pending phase transition)
       if (!response.has_more) {
+        if (this.config.debug) {
+          this.config.logger?.info({
+            msg: `[fetchOnePage:COMPLETE] ${resourceName}`,
+            object,
+            phase,
+            totalProcessedThisPage: response.data.length,
+          })
+        }
         await this.postgresClient.completeObjectSync(accountId, runStartedAt, resourceName)
       }
 

@@ -518,6 +518,45 @@ describe('Pagination regression tests', () => {
       )
     })
 
+    it('should NOT apply created.gte cursor during inactive phase', async () => {
+      sync.postgresClient.getObjectRun = vi.fn().mockResolvedValue({
+        status: 'running',
+        cursor: null,
+        pageCursor: '__phase:inactive',
+      })
+      sync.postgresClient.getLastCursorBeforeRun = vi.fn().mockResolvedValue('1771449437')
+
+      mockPricesList.mockResolvedValue({
+        data: [],
+        has_more: false,
+      })
+
+      await sync.processNext('price')
+
+      expect(mockPricesList).toHaveBeenCalledWith(expect.objectContaining({ active: false }))
+      expect(mockPricesList.mock.calls[0][0]).not.toHaveProperty('created')
+    })
+
+    it('should transition to inactive phase for prices even if listFn does not return _nextPhase', async () => {
+      // Access private resourceRegistry for testing and remove the _nextPhase signaling behavior
+      const registry = (sync as any).resourceRegistry
+      registry.price.listFn = vi.fn().mockResolvedValue({
+        data: [],
+        has_more: false,
+      })
+
+      const result = await sync.processNext('price')
+
+      // Even with no data (and no _nextPhase), we should enqueue the inactive sweep
+      expect(sync.postgresClient.updateObjectPageCursor).toHaveBeenCalledWith(
+        'acct_test',
+        expect.any(Date),
+        'prices',
+        '__phase:inactive'
+      )
+      expect(result.hasMore).toBe(true)
+    })
+
     it('should transition from active to inactive phase when active phase completes', async () => {
       mockPricesList.mockResolvedValue({
         data: [{ id: 'price_1', created: 1700000100 }],

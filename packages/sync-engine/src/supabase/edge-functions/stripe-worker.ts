@@ -27,8 +27,17 @@ const QUEUE_NAME = 'stripe_sync_work'
 const VISIBILITY_TIMEOUT = 60 // seconds
 const BATCH_SIZE = 10
 
+// Debug logging: set SYNC_DEBUG=true in Supabase env vars to enable verbose logging
+const DEBUG = Deno.env.get('SYNC_DEBUG') === 'true'
+
+function debug(...args: unknown[]) {
+  if (DEBUG) {
+    console.log('[DEBUG]', ...args)
+  }
+}
+
 Deno.serve(async (req) => {
-  console.log(`[stripe-worker] Starting invocation, sync-engine version: ${VERSION}`)
+  console.log(`[stripe-worker] Starting invocation, sync-engine version: ${VERSION}, debug: ${DEBUG}`)
   const authHeader = req.headers.get('Authorization')
   if (!authHeader?.startsWith('Bearer ')) {
     return new Response('Unauthorized', { status: 401 })
@@ -77,11 +86,21 @@ Deno.serve(async (req) => {
       return new Response('Forbidden: Invalid worker secret', { status: 403 })
     }
 
+    // Create a logger that respects DEBUG mode
+    const logger = {
+      info: (...args: unknown[]) => console.log('[INFO]', ...args),
+      warn: (...args: unknown[]) => console.warn('[WARN]', ...args),
+      error: (...args: unknown[]) => console.error('[ERROR]', ...args),
+      debug: (...args: unknown[]) => { if (DEBUG) console.log('[DEBUG]', ...args) },
+    }
+
     stripeSync = new StripeSync({
       poolConfig: { connectionString: dbUrl, max: 1 },
       stripeSecretKey: Deno.env.get('STRIPE_SECRET_KEY')!,
       enableSigma: (Deno.env.get('ENABLE_SIGMA') ?? 'false') === 'true',
       appName: Deno.env.get('STRIPE_APP_NAME') || 'PaymentsDB',
+      logger,
+      debug: DEBUG,
     })
   } catch (error) {
     await sql.end()
@@ -107,10 +126,13 @@ Deno.serve(async (req) => {
       const [{ queue_length }] =
         await sql`SELECT queue_length FROM pgmq.metrics(${QUEUE_NAME}::text)`
       if (queue_length > 0) {
-        return new Response(JSON.stringify({ version: VERSION, skipped: true, reason: 'messages still in flight' }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        })
+        return new Response(
+          JSON.stringify({ version: VERSION, skipped: true, reason: 'messages still in flight' }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        )
       }
 
       // Queue is genuinely empty. If cron is in fast mode (sub-minute) and
@@ -186,10 +208,13 @@ Deno.serve(async (req) => {
     })
   } catch (error) {
     console.error('Worker error:', error)
-    return new Response(JSON.stringify({ version: VERSION, error: error.message, stack: error.stack }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    return new Response(
+      JSON.stringify({ version: VERSION, error: error.message, stack: error.stack }),
+      {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    )
   } finally {
     if (sql) await sql.end()
     if (stripeSync) await stripeSync.postgresClient.pool.end()
